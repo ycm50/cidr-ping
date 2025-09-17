@@ -55,6 +55,10 @@ clean:
 
 # 运行目标
 run: $(TARGET)
-	$(TARGET)
+ifeq ($(OS),Windows_NT)
+	.\$(TARGET)
+else
+	./$(TARGET)
+endif
 
 .PHONY: all clean run
