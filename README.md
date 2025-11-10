@@ -20,6 +20,8 @@
 
 确保您的系统已安装GCC编译器。在Windows上，您需要MinGW，确保MinGW的bin目录已添加到系统环境变量中，例如 `C:\MinGW\bin`，建议使用msys2。在linux上，您需要安装cmake、make、gcc/g++。
 
+不要在有中文路径下编译
+
 windows直接运行install.ps1即可,linux直接运行install.sh即可
 
 ```bash
