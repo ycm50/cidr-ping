@@ -12,4 +12,6 @@ else {
 & mingw32-make
 & cmake --install .
 & mv cidr-ping.exe ..
+& mv sort-rtts.exe ..
+
 & cd ..

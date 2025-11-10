@@ -12,3 +12,4 @@ rm -rf *
 cmake .. 
 make
 mv cidr-ping ..
+mv sort-rtts ..
