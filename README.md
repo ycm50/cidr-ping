@@ -18,58 +18,58 @@
 
 ## 编译
 
-确保您的系统已安装GCC编译器。在Windows上，您可能需要MinGW或Cygwin。
+确保您的系统已安装GCC编译器。在Windows上，您需要MinGW，确保MinGW的bin目录已添加到系统环境变量中，例如 `C:\MinGW\bin`，建议使用msys2。在linux上，您需要安装cmake、make、gcc/g++。
 
-在项目根目录下运行 `make` 命令进行编译：
+windows直接运行install.ps1即可,linux直接运行install.sh即可
 
 ```bash
-make
+#windows编译,需要允许运行本地脚本
+./install.ps1
 ```
 
-这将会在 `build/bin/` 目录下生成可执行文件 `telnet_delay_test_general` (Linux/macOS) 或 `telnet_delay_test_general.exe` (Windows)。
+```bash
+#linux编译
+./install.sh
+```
+这将会在 `./` 目录下生成可执行文件 `cidr-ping` (Linux/macOS) 或 `cidr-ping.exe` (Windows)。
 
 ## 使用方法
 
 ### 运行可执行文件
 
 ```bash
-./build/bin/telnet_delay_test_general
+./cidr-ping
 ```
 
-或者在Windows上：
-
-```bash
-.\build\bin\telnet_delay_test_general.exe
-```
 
 ### 命令行参数
 
 您可以通过命令行参数指定主机、端口和生成IP的数量：
 
 ```bash
-./build/bin/telnet_delay_test_general <主机名/IP/网段> [端口] [生成IP数量]
+./cidr-ping <主机名/IP/网段> [端口] [生成IP数量]
 ```
 
 **示例：**
 
 1. **测试单个主机名或IP地址 (默认端口 443)：**
    ```bash
-   ./build/bin/telnet_delay_test_general example.com
+   ./cidr-ping example.com
    ```
 
 2. **测试单个主机名或IP地址 (指定端口 8080)：**
    ```bash
-   ./build/bin/telnet_delay_test_general 192.168.1.1 8080
+   ./cidr-ping 192.168.1.1 8080
    ```
 
 3. **测试IPv4网段并生成10个随机IP (默认端口 443)：**
    ```bash
-   ./build/bin/telnet_delay_test_general 192.168.1.0/24 443 10
+   ./cidr-ping 192.168.1.0/24 443 10
    ```
 
 4. **测试IPv6网段并生成5个随机IP (指定端口 22)：**
    ```bash
-   ./build/bin/telnet_delay_test_general 2400:cb00:2049::/48 22 5
+   ./cidr-ping 2400:cb00:2049::/48 22 5
    ```
 
 ### 交互式输入
@@ -84,13 +84,3 @@ make
 - `ip_with_brackets`: 格式化后的IP地址（IPv6地址会用方括号括起来）。
 - `ip_port_with_brackets`: 格式化后的IP地址和端口（IPv6地址会用方括号括起来）。
 - `延迟`: 连接延迟（毫秒）或错误信息。
-
-## 清理
-
-要清理编译生成的文件和目录，运行：
-
-```bash
-make clean
-```
-
-这将删除 `build` 目录及其内容，包括可执行文件和中间对象文件。
