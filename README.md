@@ -1,6 +1,12 @@
+
 # Telnet Delay Test General
 
+
+
 这是一个用于测试Telnet连接延迟的命令行工具，支持单个主机名/IP地址、IPv4网段和IPv6网段的随机IP生成和测试。测试结果将保存到 `rtts.csv` 文件中。
+
+
+## windows编译前请先安装MinGW，linux编译前请先安装cmake、make、gcc/g++
 
 ## 功能
 
