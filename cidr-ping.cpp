@@ -137,6 +137,12 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
         if (connect_result != -1) {
             break;
         }
+        else 
+        {
+            close(sockfd);
+            return -1;
+        }
+        
 
         close(sockfd);
         sockfd = -1;
