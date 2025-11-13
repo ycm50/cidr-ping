@@ -1,14 +1,6 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <errno.h>
-
+#include "cidr-ping.h"
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#pragma comment(lib, "ws2_32.lib")
+
 
 // Set console output to UTF-8 to fix encoding issues
 void set_console_utf8() {
@@ -94,18 +86,13 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
 }
 
 #else // POSIX
-#include <sys/socket.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/time.h>
 
-// Placeholder for Windows-specific function
+// 为winshell环境配置utf-8，此处占位，什么也不做
 void set_console_utf8() {
     // Not needed for POSIX systems
 }
 
-// Function to test telnet delay for POSIX systems
+//测试延迟 linux
 int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
     struct addrinfo hints, *result = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -167,7 +154,7 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
 }
 #endif
 
-// Display test results
+// 显示结果
 void display_result(const char *hostname, int port, int result, double delay_ms, FILE *csv_file) {
     char formatted_host_port[NI_MAXHOST + 10]; // Enough space for IPv6 + port
     char formatted_host[NI_MAXHOST];
@@ -325,7 +312,8 @@ void generate_random_ipv6(const unsigned char *prefix, int prefix_len, char *out
     inet_ntop(AF_INET6, &addr, output, output_size);
 }
 
-int main(int argc, char *argv[]) {
+int cidr_ping_main(int argc, char *argv[]) {
+
     // 设置控制台为UTF-8编码
     set_console_utf8();
     
@@ -333,25 +321,26 @@ int main(int argc, char *argv[]) {
     srand((unsigned int)time(NULL));
 
     FILE *csv_file = NULL;
-    csv_file = fopen("rtts.csv", "w");
+    csv_file = fopen("rtts.csv", "a");
     if (csv_file == NULL) {
         perror("无法创建或打开rtts.csv文件");
         return 1;
     }
-    fprintf(csv_file, "ip,ip_with_brackets,ip_port_with_brackets,延迟\n");
-    
+    #ifdef MAIN
+    fprintf(csv_file, "ip,ip_with_brackets,ip_port_with_brackets,延迟\\n");
+    #endif
     char hostips[256];
     int port;
-    int ip_count = 100; // 默认生成100个IP
+    int ip_count = 10; // 默认生成100个IP
     
     // 检查命令行参数
-    if (argc == 2) {
+    if (argc >= 2) {
         strncpy(hostips, argv[1], sizeof(hostips) - 1);
         hostips[sizeof(hostips) - 1] = '\0';
         
         if (argc >= 3) {
             port = atoi(argv[2]);
-            if (argc == 4) {
+            if (argc >= 4) {
                 ip_count = atoi(argv[3]);
                 if (ip_count <= 0) {
                     printf("生成IP的数量必须大于0\n");
@@ -363,9 +352,9 @@ int main(int argc, char *argv[]) {
         }
     } else {
         printf("请输入主机名或IPv6网段(格式如2400:cb00:2049::/48): ");
-        if (fgets(hostips, sizeof(hostips), stdin) == NULL) {
-            printf("输入错误\n");
-            return 1;
+        if (fgets(hostips, sizeof(hostips), stdin) == NULL||hostips[0]=='\n') {
+            char a[]="2400:cb00:2049::/48";
+            strncpy(hostips,a,sizeof(a));
         }
         
         // 移除换行符
@@ -374,7 +363,7 @@ int main(int argc, char *argv[]) {
             hostips[len-1] = '\0';
         }
         
-        printf("请输入端口号 (默认443): ");
+        printf("请末端口号 (默认443): ");
         char port_str[10];
         if (fgets(port_str, sizeof(port_str), stdin) == NULL || port_str[0] == '\n') {
             port = 443; // 默认端口
@@ -382,10 +371,10 @@ int main(int argc, char *argv[]) {
             port = atoi(port_str);
         }
         
-        printf("请输入生成IP的数量 (默认100): ");
+        printf("请输入生成IP的数量 (默认10): ");
         char count_str[10];
         if (fgets(count_str, sizeof(count_str), stdin) == NULL || count_str[0] == '\n') {
-            ip_count = 100; // 默认100个IP
+            ip_count = 10; // 默认10个IP
         } else {
             ip_count = atoi(count_str);
             if (ip_count <= 0) {
@@ -462,3 +451,12 @@ int main(int argc, char *argv[]) {
     fclose(csv_file);
     return 0;
 }
+
+
+#ifdef MAIN
+int main(int argc, char *argv[]){
+    argv[0]=" ";
+    cidr_ping_main( argc,  argv);
+    return 0;
+}
+#endif
