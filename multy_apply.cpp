@@ -30,10 +30,7 @@ int main(int argc, char* argv[]){
         };
         
         cidr_ping_main(4, args);
-    }
-
-    FILE*avail=fopen("avail",'w');
-    
+    }  
     
     fclose(file);
     return 0;

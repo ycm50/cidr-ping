@@ -55,3 +55,4 @@ endif()
 
 # sort-rtts executable
 add_executable(sort-rtts sort-rtts.cpp)
+add_executable(multy_apply multy_apply.cpp cidr-ping.cpp)
