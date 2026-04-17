@@ -51,6 +51,11 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
             continue;
         }
         
+        // 设置socket超时为1000ms
+        int timeout = 1000; // 1000毫秒
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+        
         // 连接到服务器
         connect_result = connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen);
         if (connect_result != SOCKET_ERROR) {
@@ -119,6 +124,13 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
         if (sockfd == -1) {
             continue;
         }
+
+        // 设置socket超时为1000ms
+        struct timeval timeout;
+        timeout.tv_sec = 1; // 1秒
+        timeout.tv_usec = 0; // 0微秒
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
         connect_result = connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen);
         if (connect_result != -1) {
