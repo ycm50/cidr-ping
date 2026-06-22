@@ -1,103 +1,122 @@
 #include "cidr-ping.h"
-#ifdef _WIN32
 
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <vector>
+#include <string>
+
+#ifdef _WIN32
 
 // Set console output to UTF-8 to fix encoding issues
 void set_console_utf8() {
-    SetConsoleOutputCP(65001); // Set output code page to UTF-8
-    SetConsoleCP(65001);       // Set input code page to UTF-8
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
 }
 
-// Function to test telnet delay
+// Non-blocking TCP connect with select() for precise 1000ms timeout
 int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
-    // 初始化Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        return -4; // Failed to initialize Winsock
+        return -4;
     }
-    
-    // 设置地址信息
+
     struct addrinfo hints, *result = NULL;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;     // 允许IPv4或IPv6
-    hints.ai_socktype = SOCK_STREAM; // TCP连接
-    
-    // 将端口转换为字符串
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
     char port_str[10];
     snprintf(port_str, sizeof(port_str), "%d", port);
-    
-    // 获取地址信息
-    int getaddrinfo_result = getaddrinfo(hostname, port_str, &hints, &result);
-    if (getaddrinfo_result != 0) {
+
+    if (getaddrinfo(hostname, port_str, &hints, &result) != 0) {
         WSACleanup();
-        return -1; // Failed to get host info
+        return -1;
     }
-    
-    // 创建socket并尝试连接
-    SOCKET sockfd = INVALID_SOCKET;
-    struct addrinfo *ptr = NULL;
-    int connect_result = -1;
-    
-    // 记录连接开始时间
-    LARGE_INTEGER start_time, end_time, frequency;
-    QueryPerformanceFrequency(&frequency);
+
+    LARGE_INTEGER start_time, end_time, freq;
+    QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start_time);
-    
-    // 尝试连接到获取的每个地址，直到成功
-    for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
-        // 创建socket
+
+    SOCKET sockfd = INVALID_SOCKET;
+    int connect_result = -1;
+
+    for (struct addrinfo *ptr = result; ptr != NULL; ptr = ptr->ai_next) {
         sockfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-        if (sockfd == INVALID_SOCKET) {
+        if (sockfd == INVALID_SOCKET) continue;
+
+        // Set non-blocking
+        u_long nonblock = 1;
+        ioctlsocket(sockfd, FIONBIO, &nonblock);
+
+        if (connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            // Instant success
+            QueryPerformanceCounter(&end_time);
+            *delay_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / (double)freq.QuadPart;
+            freeaddrinfo(result);
+            return 0;
+        }
+
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+            closesocket(sockfd);
+            sockfd = INVALID_SOCKET;
             continue;
         }
-        
-        // 设置socket超时为1000ms
-        int timeout = 1000; // 1000毫秒
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-        
-        // 连接到服务器
-        connect_result = connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen);
-        if (connect_result != SOCKET_ERROR) {
-            break; // 连接成功
+
+        // select() with 1000ms timeout
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sockfd, &wfds);
+        struct timeval tv = {1, 0};
+
+        int sel_ret = select((int)sockfd + 1, NULL, &wfds, NULL, &tv);
+
+        if (sel_ret <= 0) {
+            closesocket(sockfd);
+            sockfd = INVALID_SOCKET;
+            if (sel_ret == 0) {
+                connect_result = -3; // timeout — 测试前已计时，超过1000ms终止
+                break;
+            }
+            continue;
         }
-        
-        // 连接失败，关闭socket并尝试下一个地址
-        closesocket(sockfd);
-        sockfd = INVALID_SOCKET;
+
+        // Check SO_ERROR
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len) < 0 || so_error != 0) {
+            closesocket(sockfd);
+            sockfd = INVALID_SOCKET;
+            connect_result = -1;
+            continue;
+        }
+
+        // Success!
+        QueryPerformanceCounter(&end_time);
+        *delay_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        freeaddrinfo(result);
+        return 0;
     }
-    
-    // 记录连接结束时间
+
+    // All attempts failed
     QueryPerformanceCounter(&end_time);
-    
-    // 释放地址信息
+    *delay_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / (double)freq.QuadPart;
+
+    if (sockfd != INVALID_SOCKET) closesocket(sockfd);
     freeaddrinfo(result);
-    
-    // 如果socket有效，关闭它
-    if (sockfd != INVALID_SOCKET) {
-        closesocket(sockfd);
-    }
-    
     WSACleanup();
-    
-    if (connect_result == SOCKET_ERROR) {
-        return -3; // Connection failed
-    }
-    
-    // 计算延迟（毫秒）
-    *delay_ms = (double)(end_time.QuadPart - start_time.QuadPart) * 1000.0 / (double)frequency.QuadPart;
-    
-    return 0; // Success
+    return -3;
 }
 
 #else // POSIX
 
-// 为winshell环境配置utf-8，此处占位，什么也不做
+#include <fcntl.h>      // fcntl(), O_NONBLOCK
+
 void set_console_utf8() {
     // Not needed for POSIX systems
 }
 
-//测试延迟 linux
+// Non-blocking TCP connect with select() for precise 1000ms timeout
 int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
     struct addrinfo hints, *result = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -107,63 +126,84 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
     char port_str[10];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
-    int getaddrinfo_result = getaddrinfo(hostname, port_str, &hints, &result);
-    if (getaddrinfo_result != 0) {
-        return -1; // Failed to get host info
+    if (getaddrinfo(hostname, port_str, &hints, &result) != 0) {
+        return -1;
     }
-
-    int sockfd = -1;
-    struct addrinfo *ptr = NULL;
-    int connect_result = -1;
 
     struct timeval start_time, end_time;
     gettimeofday(&start_time, NULL);
 
-    for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
+    int sockfd = -1;
+    int connect_result = -1;
+
+    for (struct addrinfo *ptr = result; ptr != NULL; ptr = ptr->ai_next) {
         sockfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-        if (sockfd == -1) {
+        if (sockfd < 0) continue;
+
+        // Set non-blocking
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+        if (connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            gettimeofday(&end_time, NULL);
+            *delay_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                        (end_time.tv_usec - start_time.tv_usec) / 1000.0;
+            freeaddrinfo(result);
+            return 0;
+        }
+
+        if (errno != EINPROGRESS) {
+            close(sockfd);
+            sockfd = -1;
             continue;
         }
 
-        // 设置socket超时为1000ms
-        struct timeval timeout;
-        timeout.tv_sec = 1; // 1秒
-        timeout.tv_usec = 0; // 0微秒
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        // select() with 1000ms timeout
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sockfd, &wfds);
+        struct timeval tv = {1, 0};
 
-        connect_result = connect(sockfd, ptr->ai_addr, (int)ptr->ai_addrlen);
-        if (connect_result != -1) {
-            break;
-        }
-        else 
-        {
+        int sel_ret = select(sockfd + 1, NULL, &wfds, NULL, &tv);
+
+        if (sel_ret <= 0) {
             close(sockfd);
-            return -1;
+            sockfd = -1;
+            if (sel_ret == 0) {
+                connect_result = -3; // timeout — 测试前已计时，超过1000ms终止
+                break;
+            }
+            continue;
         }
-        
 
-        close(sockfd);
-        sockfd = -1;
+        // Check SO_ERROR
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
+            close(sockfd);
+            sockfd = -1;
+            connect_result = -1;
+            continue;
+        }
+
+        // Success!
+        gettimeofday(&end_time, NULL);
+        *delay_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                    (end_time.tv_usec - start_time.tv_usec) / 1000.0;
+        freeaddrinfo(result);
+        return 0;
     }
 
+    // All attempts failed
     gettimeofday(&end_time, NULL);
+    *delay_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                (end_time.tv_usec - start_time.tv_usec) / 1000.0;
 
+    if (sockfd >= 0) close(sockfd);
     freeaddrinfo(result);
-
-    if (sockfd != -1) {
-        close(sockfd);
-    }
-
-    if (connect_result == -1) {
-        return -3; // Connection failed
-    }
-
-    *delay_ms = (double)(end_time.tv_sec - start_time.tv_sec) * 1000.0 +
-                (double)(end_time.tv_usec - start_time.tv_usec) / 1000.0;
-
-    return 0; // Success
+    return -3;
 }
+
 #endif
 
 // 显示结果
@@ -324,32 +364,49 @@ void generate_random_ipv6(const unsigned char *prefix, int prefix_len, char *out
     inet_ntop(AF_INET6, &addr, output, output_size);
 }
 
-int cidr_ping_main(int argc, char *argv[]) {
+// Thread-safe test target — 测试前预先拟好测试列表
+struct TestTarget {
+    std::string ip_str;
+    int port;
+};
 
-    // 设置控制台为UTF-8编码
+// Worker thread function — 通过原子索引安全地获取下一个目标并测试
+static void worker_thread_func(
+    const std::vector<TestTarget>& targets,
+    std::atomic<size_t>& next_index,
+    FILE* csv_file,
+    std::mutex& io_mutex)
+{
+    while (true) {
+        size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= targets.size()) break;
+
+        const TestTarget& target = targets[idx];
+
+        // 每个独立线程在测试前计时（test_telnet_delay内部开始计时）
+        double delay_ms;
+        int result = test_telnet_delay(target.ip_str.c_str(), target.port, &delay_ms);
+
+        // 加锁保证线程安全的I/O输出
+        {
+            std::lock_guard<std::mutex> lock(io_mutex);
+            printf("[%zu/%zu] ", idx + 1, targets.size());
+            display_result(target.ip_str.c_str(), target.port, result, delay_ms, csv_file);
+        }
+    }
+}
+
+int cidr_ping_main(int argc, char *argv[]) {
     set_console_utf8();
-    
-    // 初始化随机数生成器
     srand((unsigned int)time(NULL));
 
-    FILE *csv_file = NULL;
-    csv_file = fopen("rtts.csv", "a");
-    if (csv_file == NULL) {
-        perror("无法创建或打开rtts.csv文件");
-        return 1;
-    }
-    #ifdef MAIN
-    fprintf(csv_file, "ip,ip_with_brackets,ip_port_with_brackets,延迟\\n");
-    #endif
-    char hostips[256];
-    int port;
-    int ip_count = 10; // 默认生成100个IP
-    
-    // 检查命令行参数
+    // ====== Parse arguments ======
+    std::string hostips;
+    int port = 443;
+    int ip_count = 10;
+
     if (argc >= 2) {
-        strncpy(hostips, argv[1], sizeof(hostips) - 1);
-        hostips[sizeof(hostips) - 1] = '\0';
-        
+        hostips = argv[1];
         if (argc >= 3) {
             port = atoi(argv[2]);
             if (argc >= 4) {
@@ -359,107 +416,124 @@ int cidr_ping_main(int argc, char *argv[]) {
                     return 1;
                 }
             }
-        } else {
-            port = 443; // 默认端口
         }
     } else {
+        char buf[256];
         printf("请输入主机名或IPv6网段(格式如2400:cb00:2049::/48): ");
-        if (fgets(hostips, sizeof(hostips), stdin) == NULL||hostips[0]=='\n') {
-            char a[]="2400:cb00:2049::/48";
-            strncpy(hostips,a,sizeof(a));
+        if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0] == '\n') {
+            hostips = "2400:cb00:2049::/48";
+        } else {
+            hostips = buf;
+            size_t len = hostips.length();
+            if (len > 0 && hostips[len-1] == '\n') {
+                hostips.pop_back();
+            }
         }
-        
-        // 移除换行符
-        size_t len = strlen(hostips);
-        if (len > 0 && hostips[len-1] == '\n') {
-            hostips[len-1] = '\0';
-        }
-        
+
         printf("请末端口号 (默认443): ");
-        char port_str[10];
-        if (fgets(port_str, sizeof(port_str), stdin) == NULL || port_str[0] == '\n') {
-            port = 443; // 默认端口
+        if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0] == '\n') {
+            port = 443;
         } else {
-            port = atoi(port_str);
+            port = atoi(buf);
         }
-        
+
         printf("请输入生成IP的数量 (默认10): ");
-        char count_str[10];
-        if (fgets(count_str, sizeof(count_str), stdin) == NULL || count_str[0] == '\n') {
-            ip_count = 10; // 默认10个IP
+        if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0] == '\n') {
+            ip_count = 10;
         } else {
-            ip_count = atoi(count_str);
+            ip_count = atoi(buf);
             if (ip_count <= 0) {
                 printf("生成IP的数量必须大于0\n");
                 return 1;
             }
         }
     }
-    
-    // 验证端口号
+
     if (port <= 0 || port > 65535) {
         printf("端口必须是1-65535之间的数字\n");
         return 1;
     }
-    
-    // 检查是否是IPv6网段格式
-    char *slash_pos = strchr(hostips, '/');
-    if (slash_pos != NULL) {
-        // 检查是否是IPv4网段格式
-        if (strchr(hostips, '.') != NULL) {
-            // 是IPv4网段，生成随机IP
+
+    // ====== Phase 1: Pre-generate all test targets ======
+    // 在测试前先拟好完整的测试列表，保证所有IP在单线程中生成（rand()非线程安全）
+    std::vector<TestTarget> targets;
+
+    std::string::size_type slash_pos = hostips.find('/');
+    if (slash_pos != std::string::npos) {
+        if (hostips.find('.') != std::string::npos) {
+            // IPv4 CIDR
             unsigned int ipv4_prefix_addr;
             int ipv4_prefix_len;
-            char random_ipv4[INET_ADDRSTRLEN];
-
-            if (parse_ipv4_prefix(hostips, &ipv4_prefix_addr, &ipv4_prefix_len) != 0) {
-                printf("无效的IPv4网段格式: %s\n", hostips);
+            if (parse_ipv4_prefix(hostips.c_str(), &ipv4_prefix_addr, &ipv4_prefix_len) != 0) {
+                printf("无效的IPv4网段格式: %s\n", hostips.c_str());
                 return 1;
             }
 
+            targets.reserve((size_t)ip_count);
             for (int i = 0; i < ip_count; i++) {
-                generate_random_ipv4(ipv4_prefix_addr, ipv4_prefix_len, random_ipv4, sizeof(random_ipv4));
-                printf("生成的随机IPv4地址: %s\n", random_ipv4);
-
-                // 测试连接
-                double delay_ms;
-                int result = test_telnet_delay(random_ipv4, port, &delay_ms);
-
-                // 显示结果
-                display_result(random_ipv4, port, result, delay_ms, csv_file);
+                char ip_str[INET_ADDRSTRLEN];
+                generate_random_ipv4(ipv4_prefix_addr, ipv4_prefix_len, ip_str, sizeof(ip_str));
+                targets.push_back({std::string(ip_str), port});
             }
+            printf("已完成IPv4地址生成，共 %d 个目标\n", ip_count);
         } else {
-            // 是IPv6网段，生成随机IP
+            // IPv6 CIDR
             unsigned char prefix[16];
             int prefix_len;
-            char random_ip[INET6_ADDRSTRLEN];
-            
-            if (parse_ipv6_prefix(hostips, prefix, &prefix_len) != 0) {
-                printf("无效的IPv6网段格式: %s\n", hostips);
+            if (parse_ipv6_prefix(hostips.c_str(), prefix, &prefix_len) != 0) {
+                printf("无效的IPv6网段格式: %s\n", hostips.c_str());
                 return 1;
             }
-            
+
+            targets.reserve((size_t)ip_count);
             for (int i = 0; i < ip_count; i++) {
-                generate_random_ipv6(prefix, prefix_len, random_ip, sizeof(random_ip));
-                printf("生成的随机IPv6地址: %s\n", random_ip);
-                
-                // 测试连接
-                double delay_ms;
-                int result = test_telnet_delay(random_ip, port, &delay_ms);
-                
-                // 显示结果
-                display_result(random_ip, port, result, delay_ms, csv_file);
+                char ip_str[INET6_ADDRSTRLEN];
+                generate_random_ipv6(prefix, prefix_len, ip_str, sizeof(ip_str));
+                targets.push_back({std::string(ip_str), port});
             }
+            printf("已完成IPv6地址生成，共 %d 个目标\n", ip_count);
         }
     } else {
-        // 普通主机名或IP地址
-        double delay_ms;
-        int result = test_telnet_delay(hostips, port, &delay_ms);
-        
-        // 显示结果
-        display_result(hostips, port, result, delay_ms, csv_file);
+        // Single host
+        targets.push_back({hostips, port});
     }
-    
+
+    // ====== Phase 2: Open CSV ======
+    FILE* csv_file = fopen("rtts.csv", "w");
+    if (csv_file == NULL) {
+        perror("无法创建或打开rtts.csv文件");
+        return 1;
+    }
+    // Write UTF-8 BOM to fix Chinese character encoding in Excel/other tools
+    fprintf(csv_file, "\xEF\xBB\xBF");
+#ifdef MAIN
+    fprintf(csv_file, "ip,ip_with_brackets,ip_port_with_brackets,延迟\n");
+#endif
+
+    // ====== Phase 3: Threaded testing ======
+    size_t num_targets = targets.size();
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    if (num_threads > num_targets) num_threads = (unsigned int)num_targets;
+
+    printf("开始并发测试: %zu 个目标, %u 个线程\n", num_targets, num_threads);
+
+    std::atomic<size_t> next_index(0);
+    std::mutex io_mutex;
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    for (unsigned int i = 0; i < num_threads; i++) {
+        threads.emplace_back(worker_thread_func,
+            std::ref(targets), std::ref(next_index), csv_file, std::ref(io_mutex));
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    printf("所有测试完成\n");
     fclose(csv_file);
     return 0;
 }
