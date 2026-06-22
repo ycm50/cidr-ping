@@ -1,6 +1,5 @@
 #include<stdio.h>
 #include<stdlib.h>
-#include<pthread.h>
 #include"cidr-ping.h"
 
 int main(int argc, char* argv[]){
