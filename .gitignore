@@ -1,0 +1,6 @@
+build/
+rtts.csv
+rtts_sorted.csv
+*.exe
+*.o
+*.obj

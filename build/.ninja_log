@@ -1,8 +1,0 @@
-# ninja log v7
-22	398	8038017726514844	CMakeFiles/sort-rtts.dir/sort-rtts.cpp.obj	66d390146712de62
-402	501	8038017730323638	sort-rtts.exe	4eff0405c20e5e7b
-24	739	8038017726534815	CMakeFiles/multy_apply.dir/multy_apply.cpp.obj	4c47e372e5a08e7
-19	1057	8038017726483034	CMakeFiles/cidr-ping.dir/cidr-ping.cpp.obj	f9555028349679e8
-27	1062	8038017726565376	CMakeFiles/multy_apply.dir/cidr-ping.cpp.obj	f4bba4d7f46ce517
-1062	1176	8038017736911539	multy_apply.exe	210a602742950655
-1057	1176	8038017736860482	cidr-ping.exe	efb0a8bc9c0e7335

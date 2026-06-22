@@ -1,5 +1,0 @@
-A:/Downloads/mxplayer/cidr-ping/build/CMakeFiles/cidr-ping.dir
-A:/Downloads/mxplayer/cidr-ping/build/CMakeFiles/sort-rtts.dir
-A:/Downloads/mxplayer/cidr-ping/build/CMakeFiles/multy_apply.dir
-A:/Downloads/mxplayer/cidr-ping/build/CMakeFiles/edit_cache.dir
-A:/Downloads/mxplayer/cidr-ping/build/CMakeFiles/rebuild_cache.dir
