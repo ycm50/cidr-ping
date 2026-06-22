@@ -111,6 +111,7 @@ int test_telnet_delay(const char *hostname, int port, double *delay_ms) {
 #else // POSIX
 
 #include <fcntl.h>      // fcntl(), O_NONBLOCK
+#include <sys/select.h> // select(), fd_set
 
 void set_console_utf8() {
     // Not needed for POSIX systems
@@ -541,8 +542,9 @@ int cidr_ping_main(int argc, char *argv[]) {
 
 #ifdef MAIN
 int main(int argc, char *argv[]){
-    argv[0]=" ";
-    cidr_ping_main( argc,  argv);
+    char prog[] = " ";
+    argv[0] = prog;
+    cidr_ping_main(argc, argv);
     return 0;
 }
 #endif
