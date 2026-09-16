@@ -1,0 +1,501 @@
+# cidr-ping 多平台构建 / 测试 / 发布流水线
+#
+# 触发行为
+#   push 到 main|master  -> 全平台编译 + 单元测试 + 上传 artifact（不发 Release）
+#   pull_request         -> 只跑 linux-native + windows 两组，跳过重型（模拟/交叉）任务
+#   push tag (v* / 1.0)  -> 全平台编译 + 测试 + 打包 + 创建 GitHub Release
+#   workflow_dispatch    -> 自动递增版本号并发布（v1.0 -> v1.1 -> ... -> v1.9 -> v2.0 -> ...），
+#                           也可以用输入框手动指定 tag
+#
+# 说明
+#   * job 级 if 不能引用 matrix.*，所以 PR 跳过重型任务用的是
+#     `if: github.event_name != 'pull_request'`（矩阵内部无法按条目跳过）。
+#   * 产物命名统一为 cidr-ping-<tag>-<平台>.zip；非发布场景 <tag> = dev-<短 sha>。
+#   * 平台基线：linux-x86_64/aarch64 用 Ubuntu 22.04 原生 runner（glibc 2.35）；
+#     linux-armv7l/i686 用 Debian 12 容器 + QEMU（glibc 2.36）；
+#     linux-riscv64 用 Ubuntu 24.04 容器 + QEMU（glibc 2.39，debian:bookworm 没有官方 riscv64 镜像）；
+#     windows-* 用 llvm-mingw 在 Linux 上交叉编译（UCRT，单文件静态 exe）；
+#     termux-* 用 Termux 官方 termux-docker（bionic + libc++）。
+#   * 交叉编译出的 Windows 可执行文件无法在 Linux runner 上运行，
+#     因此该 job 传 -DBUILD_TESTING=OFF，改为用 objdump 校验“静态链接、无动态运行库依赖”。
+
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*', '[0-9]*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布版本号（留空 = 自动递增：v1.0 -> v1.1 -> ... -> v1.9 -> v2.0）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 版本号：tag 推送直接取 tag；workflow_dispatch 自动递增或取手填值；
+  #         普通分支提交/PR 用 dev-<短 sha>
+  # ---------------------------------------------------------------------------
+  version:
+    name: 计算版本号
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      release: ${{ steps.compute.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: 计算 tag
+        id: compute
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          input="${INPUT_TAG:-}"
+          if [ -n "$input" ]; then
+            tag="$input"
+            release=true
+            echo "使用手填版本号: $tag"
+          elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            release=true
+            echo "使用推送的 tag: $tag"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # 在所有 v<major>.<minor> 标签中取最大值，然后 +1
+            # minor 到 9 之后进位到下一个 major：v1.9 -> v2.0
+            max_major=-1
+            max_minor=-1
+            while read -r t; do
+              if [[ "$t" =~ ^v?([0-9]+)\.([0-9]+)$ ]]; then
+                mj="${BASH_REMATCH[1]}"
+                mn="${BASH_REMATCH[2]}"
+                if (( mj > max_major || (mj == max_major && mn > max_minor) )); then
+                  max_major="$mj"
+                  max_minor="$mn"
+                fi
+              fi
+            done < <(git tag -l)
+
+            if (( max_major < 0 )); then
+              max_major=1
+              max_minor=0
+            elif (( max_minor >= 9 )); then
+              max_major=$((max_major + 1))
+              max_minor=0
+            else
+              max_minor=$((max_minor + 1))
+            fi
+
+            tag="v${max_major}.${max_minor}"
+            release=true
+            echo "自动递增版本号: $tag"
+          else
+            tag="dev-${GITHUB_SHA:0:7}"
+            release=false
+            echo "非发布场景，使用: $tag"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Linux 原生（x86_64 / aarch64，都是 GitHub 托管原生 runner）
+  # ---------------------------------------------------------------------------
+  linux-native:
+    name: linux-native (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zip
+
+      - name: 配置
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
+            -DBUILD_TESTING=ON
+          # glibc 基线（供参考）
+          ldd --version | head -n1
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 单元测试
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 冒烟测试（真实二进制 + IP 池必须取空 + CSV 行数）
+        run: |
+          set -euo pipefail
+          mkdir -p smoke && cd smoke
+          out="$(../build/cidr-ping 127.0.0.0/16 1 50 2>&1)"
+          printf '%s\n' "$out" | tail -n 3
+          printf '%s\n' "$out" | grep -q '开始并行测速'
+          printf '%s\n' "$out" | grep -q 'IP池剩余: 0'
+          lines="$(wc -l < rtts.csv)"
+          echo "rtts.csv 行数: $lines (期望 51 = BOM表头 1 + 数据 50)"
+          test "$lines" -eq 51
+
+      - name: 校验动态库导出符号
+        run: |
+          set -euo pipefail
+          ls -l build/
+          nm -D --defined-only build/libcidr-ping.so | grep cidr_ping_main
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          files=(build/cidr-ping cidr-ping.h README.md)
+          for f in build/libcidr-ping.so build/libcidr-ping.a; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          zip -j "artifacts/cidr-ping-${TAG}-${PLATFORM}.zip" "${files[@]}"
+          ls -l artifacts/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cidr-ping-${{ needs.version.outputs.tag }}-${{ matrix.platform }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows（llvm-mingw 交叉编译，UCRT，静态链接单文件）
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows (${{ matrix.platform }})
+    needs: version
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            target: x86_64-w64-mingw32
+          - platform: windows-aarch64
+            target: aarch64-w64-mingw32
+    env:
+      LLVM_MINGW_VER: '20260908'
+      TAG: ${{ needs.version.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 下载 llvm-mingw
+        run: |
+          set -euo pipefail
+          url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VER}/llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          echo "下载 $url"
+          mkdir -p "$HOME/llvm-mingw"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/llvm-mingw" --strip-components=1
+          "$HOME/llvm-mingw/bin/${{ matrix.target }}-g++" --version | head -n1
+
+      - name: 交叉编译
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/llvm-mingw/bin:$PATH"
+          # 交叉产物不能在本机执行，关掉测试目标（下面的 objdump 校验代替）
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER="${TARGET}-gcc" \
+            -DCMAKE_CXX_COMPILER="${TARGET}-g++" \
+            -DCMAKE_RC_COMPILER="${TARGET}-windres" \
+            -DCMAKE_FIND_ROOT_PATH="$HOME/llvm-mingw/${TARGET}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static" \
+            -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
+            -DBUILD_TESTING=OFF
+          cmake --build build --parallel
+
+      - name: 校验静态链接与导出符号
+        # 必须用工具链自带的 llvm-objdump：系统 binutils 不认识 ARM64 的 PE 文件
+        # （会报 "file format not recognized"，在 pipefail 下直接让步骤失败）
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/llvm-mingw/bin:$PATH"
+          for f in build/cidr-ping.exe build/libcidr-ping.dll; do
+            [ -f "$f" ] || { echo "::error::找不到 $f"; exit 1; }
+            echo "--- $f"
+            file "$f" || true
+            llvm-objdump -p "$f" | awk '/DLL Name:/ { print "    依赖: " $3 }'
+            if llvm-objdump -p "$f" | grep -Eiq 'libstdc\+\+|libgcc_s|libwinpthread'; then
+              echo "::error::$f 仍依赖动态运行库，请检查 -static 链接选项"
+              exit 1
+            fi
+          done
+          echo "--- 导出符号（导入库 libcidr-ping.dll.a）"
+          llvm-nm build/libcidr-ping.dll.a | grep cidr_ping_main
+          echo "OK: 产物不含动态 C++ 运行库依赖，且 cidr_ping_main 已导出"
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          files=(build/cidr-ping.exe cidr-ping.h README.md)
+          for f in build/libcidr-ping.dll build/libcidr-ping.dll.a build/libcidr-ping.a; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          zip -j "artifacts/cidr-ping-${TAG}-${PLATFORM}.zip" "${files[@]}"
+          ls -l artifacts/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cidr-ping-${{ needs.version.outputs.tag }}-${{ matrix.platform }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux 非 x86 架构（容器 + QEMU），PR 时跳过
+  # ---------------------------------------------------------------------------
+  linux-emulated:
+    name: linux-emulated (${{ matrix.platform }})
+    needs: version
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-armv7l
+            image: arm32v7/debian:12
+            qemu: linux/arm/v7
+          - platform: linux-i686
+            image: i386/debian:12
+            qemu: linux/386
+          - platform: linux-riscv64
+            image: riscv64/ubuntu:24.04
+            qemu: linux/riscv64
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+      IMAGE: ${{ matrix.image }}
+      QEMU: ${{ matrix.qemu }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 注册 QEMU binfmt
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm,386,riscv64
+
+      - name: 容器内编译 + 测试 + 打包
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "$QEMU" \
+            -e TAG="$TAG" -e PLATFORM="$PLATFORM" \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            "$IMAGE" bash -c '
+              set -eux
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends cmake ninja-build g++ ca-certificates zip
+
+              g++ --version | head -n1
+              ldd --version | head -n1
+
+              cmake -S . -B build-emu -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
+                -DBUILD_TESTING=ON
+              cmake --build build-emu --parallel
+              ctest --test-dir build-emu --output-on-failure
+
+              mkdir -p smoke
+              cd smoke
+              out="$(../build-emu/cidr-ping 127.0.0.0/16 1 50 2>&1)"
+              printf "%s\n" "$out" | tail -n 3
+              printf "%s\n" "$out" | grep -q "开始并行测速"
+              printf "%s\n" "$out" | grep -q "IP池剩余: 0"
+              test "$(wc -l < rtts.csv)" -eq 51
+              cd ..
+
+              nm -D --defined-only build-emu/libcidr-ping.so | grep cidr_ping_main
+
+              mkdir -p artifacts
+              files=(build-emu/cidr-ping cidr-ping.h README.md)
+              for f in build-emu/libcidr-ping.so build-emu/libcidr-ping.a; do
+                [ -f "$f" ] && files+=("$f")
+              done
+              zip -j "artifacts/cidr-ping-${TAG}-${PLATFORM}.zip" "${files[@]}"
+              ls -l artifacts/
+
+              # 容器里以 root 创建的文件交还宿主 runner，方便后续步骤与收尾清理
+              chown -R "$(stat -c %u:%g /work)" /work/build-emu /work/smoke /work/artifacts
+            '
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cidr-ping-${{ needs.version.outputs.tag }}-${{ matrix.platform }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Termux（官方 termux-docker：bionic + libc++），PR 时跳过
+  # ---------------------------------------------------------------------------
+  termux:
+    name: termux (${{ matrix.platform }})
+    needs: version
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: termux-aarch64
+            image: termux/termux-docker:aarch64
+            qemu: linux/arm64
+          - platform: termux-arm
+            image: termux/termux-docker:arm
+            qemu: linux/arm/v7
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PLATFORM: ${{ matrix.platform }}
+      IMAGE: ${{ matrix.image }}
+      QEMU: ${{ matrix.qemu }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 注册 QEMU binfmt
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm,arm64
+
+      - name: 准备可写输出目录
+        run: |
+          mkdir -p artifacts
+          chmod 0777 artifacts
+
+      - name: 容器内编译 + 测试 + 打包
+        # termux-docker 的 entrypoint 会用 `env -i` 清洗环境变量，
+        # 所以 -e 传不进去，改成位置参数传给容器内的 bash。
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "$QEMU" \
+            --security-opt seccomp:unconfined \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/artifacts:/out" \
+            "$IMAGE" bash -c '
+              set -eux
+              TAG="$1"
+              PLATFORM="$2"
+              id
+              echo "PREFIX=$PREFIX HOME=$HOME"
+
+              apt update
+              apt install -y cmake ninja clang zip
+
+              # 绑定挂载是只读的，复制到 $HOME（属主 system:1000）里再编译
+              # 注意：这里是显式列文件，新增源文件必须同步加进来，
+              # 否则 CMake 会因为找不到源文件而在配置阶段就失败。
+              mkdir -p "$HOME/work"
+              cp -r /src/CMakeLists.txt /src/cidr-ping.cpp /src/cidr-ping.h \
+                    /src/wireguard.cpp /src/wireguard.h \
+                    /src/sort-rtts.cpp /src/multy_apply.cpp /src/README.md \
+                    /src/tests "$HOME/work/"
+              cd "$HOME/work"
+
+              clang++ --version | head -n1
+
+              cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+                -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
+                -DBUILD_TESTING=ON
+              cmake --build build --parallel
+              ctest --test-dir build --output-on-failure
+
+              mkdir -p smoke
+              cd smoke
+              out="$(../build/cidr-ping 127.0.0.0/16 1 50 2>&1)"
+              printf "%s\n" "$out" | tail -n 3
+              printf "%s\n" "$out" | grep -q "开始并行测速"
+              printf "%s\n" "$out" | grep -q "IP池剩余: 0"
+              test "$(wc -l < rtts.csv)" -eq 51
+              cd ..
+
+              mkdir -p pack
+              cp build/cidr-ping pack/
+              for f in build/libcidr-ping.so build/libcidr-ping.a; do
+                [ -f "$f" ] && cp "$f" pack/
+              done
+              cp cidr-ping.h README.md pack/
+              zip -j "/out/cidr-ping-${TAG}-${PLATFORM}.zip" pack/*
+            ' _ "$TAG" "$PLATFORM"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cidr-ping-${{ needs.version.outputs.tag }}-${{ matrix.platform }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 发布：只有 tag 推送和 workflow_dispatch 会走这里
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 ${{ needs.version.outputs.tag }}
+    needs: [ version, linux-native, windows, linux-emulated, termux ]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列出待发布产物
+        run: ls -lR dist
+
+      - name: 创建 / 更新 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::没有找到任何产物"
+            exit 1
+          fi
+          ls -l "${files[@]}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "cidr-ping $TAG" \
+              --notes "自动构建发布（tag: $TAG）。平台: linux-x86_64 / linux-aarch64 / linux-armv7l / linux-i686 / linux-riscv64 / windows-x86_64 / windows-aarch64 / termux-aarch64 / termux-arm"
+          fi

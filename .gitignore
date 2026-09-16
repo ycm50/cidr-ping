@@ -1,6 +1,24 @@
+# ---- 构建目录 / 构建结果 ----
 build/
-rtts.csv
-rtts_sorted.csv
+build-*/
+cmake-build-*/
+out/
+dist/
+artifacts/
+smoke/
+
+# ---- 编译与打包产物 ----
 *.exe
+*.dll
+*.dll.a
+*.so
+*.a
 *.o
 *.obj
+*.zip
+
+# ---- 运行 / 测试产物 ----
+rtts.csv
+rtts_sorted.csv
+*.log
+*.tmp

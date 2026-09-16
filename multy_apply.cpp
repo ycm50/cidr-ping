@@ -19,9 +19,10 @@ int main(int argc, char* argv[]){
     char line[46] = {0};
     while (fgets(line, sizeof(line), file) != NULL) {
         line[strcspn(line, "\r\n")] = 0;
+        char prog[] = "cidr-ping"; // 可变数组，避免把字符串常量赋给 char*
         // 创建参数字符串数组
         char* args[] = {
-            "cidr-ping",     // 程序名
+            prog,            // 程序名
             line,            // CIDR行
             argv[2],         // 端口字符串
             argv[3],         // 数量字符串

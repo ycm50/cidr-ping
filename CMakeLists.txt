@@ -12,7 +12,7 @@ option(BUILD_STATIC_LIB "Build a static library" OFF)
 option(BUILD_SHARED_LIB "Build a shared library" OFF)
 
 # Common source files
-set(CIDR_PING_SOURCES cidr-ping.cpp)
+set(CIDR_PING_SOURCES cidr-ping.cpp wireguard.cpp)
 
 # Executable target
 if(BUILD_EXECUTABLE)
@@ -58,10 +58,32 @@ if(BUILD_SHARED_LIB)
     endif()
 endif()
 
+# Unit / integration tests
+# 默认开启（include(CTest) 会定义 BUILD_TESTING，默认 ON）。
+# 交叉编译（如 llvm-mingw 出的 Windows 可执行文件）无法在构建机上运行，
+# 这类情况下请显式传 -DBUILD_TESTING=OFF。
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cidr-ping-tests tests/test_cidr_ping.cpp ${CIDR_PING_SOURCES})
+    target_include_directories(cidr-ping-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(cidr-ping-tests PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_libraries(cidr-ping-tests PRIVATE ws2_32)
+    endif()
+    if(MSVC)
+        target_compile_options(cidr-ping-tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME cidr-ping-tests COMMAND cidr-ping-tests)
+    # 测试会在工作目录下反复写 rtts.csv，固定到构建目录，避免污染源码树
+    set_tests_properties(cidr-ping-tests PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        TIMEOUT 900)
+endif()
+
 # sort-rtts executable
 add_executable(sort-rtts sort-rtts.cpp)
 target_link_libraries(sort-rtts PRIVATE Threads::Threads)
-add_executable(multy_apply multy_apply.cpp cidr-ping.cpp)
+add_executable(multy_apply multy_apply.cpp ${CIDR_PING_SOURCES})
 target_link_libraries(multy_apply PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(multy_apply PRIVATE ws2_32)
