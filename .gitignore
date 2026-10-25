@@ -20,5 +20,10 @@ smoke/
 # ---- 运行 / 测试产物 ----
 rtts.csv
 rtts_sorted.csv
+rtts_merged.csv
+rtts_part.csv
 *.log
 *.tmp
+
+# ---- 审查用的临时脚本 / 探针 ----
+tmpscripts/

@@ -147,10 +147,22 @@ jobs:
           ldd --version | head -n1
 
       - name: 编译
-        run: cmake --build build --parallel
+        run: |
+          set -euo pipefail
+          if ! cmake --build build --parallel 2>&1 | tee build.log; then
+            grep -iE "error|错误|undefined reference|Cannot find" build.log | head -n 20 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - name: 单元测试
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          set -euo pipefail
+          if ! ctest --test-dir build --output-on-failure 2>&1 | tee ctest.log; then
+            grep -iE "FAIL|error|失败" ctest.log | head -n 20 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - name: 冒烟测试（真实二进制 + IP 池必须取空 + CSV 行数）
         run: |
@@ -164,6 +176,20 @@ jobs:
           echo "rtts.csv 行数: $lines (期望 51 = BOM表头 1 + 数据 50)"
           test "$lines" -eq 51
 
+      - name: sort-rtts 冒烟测试（表头保留 + 失败行跳过）
+        run: |
+          set -euo pipefail
+          cd smoke
+          # 先造一份含「成功 + 失败」混合结果的表
+          ../build/cidr-ping 127.0.0.0/30 1 4 >/dev/null
+          ../build/sort-rtts
+          grep -q '延迟,detail' rtts_sorted.csv
+          # 全部失败的行都必须被跳过，且输出仍保留表头
+          ../build/cidr-ping --udp --udp-timeout=100 127.0.0.1 1 50 >/dev/null
+          ../build/sort-rtts
+          test "$(wc -l < rtts_sorted.csv)" -ge 1
+          grep -q '延迟,detail' rtts_sorted.csv
+
       - name: 校验动态库导出符号
         run: |
           set -euo pipefail
@@ -174,7 +200,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          files=(build/cidr-ping cidr-ping.h README.md)
+          files=(build/cidr-ping cidr-ping.h text-util.h rtts-sort.h README.md)
           for f in build/libcidr-ping.so build/libcidr-ping.a; do
             [ -f "$f" ] && files+=("$f")
           done
@@ -236,7 +262,13 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-static" \
             -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
             -DBUILD_TESTING=OFF
-          cmake --build build --parallel
+          # 失败时把错误行以 ::error:: 注解输出：注解可以通过无需鉴权的 checks API 读到，
+          # 便于在没有 token 的环境里直接定位编译/链接错误。
+          if ! cmake --build build --parallel 2>&1 | tee build.log; then
+            grep -iE "error|错误|undefined reference|Cannot find" build.log | head -n 20 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - name: 校验静态链接与导出符号
         # 必须用工具链自带的 llvm-objdump：系统 binutils 不认识 ARM64 的 PE 文件
@@ -262,7 +294,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          files=(build/cidr-ping.exe cidr-ping.h README.md)
+          files=(build/cidr-ping.exe cidr-ping.h text-util.h rtts-sort.h README.md)
           for f in build/libcidr-ping.dll build/libcidr-ping.dll.a build/libcidr-ping.a; do
             [ -f "$f" ] && files+=("$f")
           done
@@ -338,12 +370,14 @@ jobs:
               printf "%s\n" "$out" | grep -q "开始并行测速"
               printf "%s\n" "$out" | grep -q "IP池剩余: 0"
               test "$(wc -l < rtts.csv)" -eq 51
+              ../build-emu/sort-rtts
+              grep -q "延迟,detail" rtts_sorted.csv
               cd ..
 
               nm -D --defined-only build-emu/libcidr-ping.so | grep cidr_ping_main
 
               mkdir -p artifacts
-              files=(build-emu/cidr-ping cidr-ping.h README.md)
+              files=(build-emu/cidr-ping cidr-ping.h text-util.h rtts-sort.h README.md)
               for f in build-emu/libcidr-ping.so build-emu/libcidr-ping.a; do
                 [ -f "$f" ] && files+=("$f")
               done
@@ -421,18 +455,27 @@ jobs:
               mkdir -p "$HOME/work"
               cp -r /src/CMakeLists.txt /src/cidr-ping.cpp /src/cidr-ping.h \
                     /src/wireguard.cpp /src/wireguard.h \
+                    /src/text-util.h /src/rtts-sort.h \
                     /src/sort-rtts.cpp /src/multy_apply.cpp /src/README.md \
                     /src/tests "$HOME/work/"
               cd "$HOME/work"
 
               clang++ --version | head -n1
 
-              cmake -S . -B build -G Ninja \
+              if ! cmake -S . -B build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
                 -DBUILD_EXECUTABLE=ON -DBUILD_STATIC_LIB=ON -DBUILD_SHARED_LIB=ON \
-                -DBUILD_TESTING=ON
-              cmake --build build --parallel
+                -DBUILD_TESTING=ON 2>&1 | tee cfg.log; then
+                grep -iE "error|错误|Cannot find" cfg.log | head -n 20 |
+                  while IFS= read -r line; do echo "::error::$line"; done
+                exit 1
+              fi
+              if ! cmake --build build --parallel 2>&1 | tee build.log; then
+                grep -iE "error|错误|undefined reference|Cannot find" build.log | head -n 20 |
+                  while IFS= read -r line; do echo "::error::$line"; done
+                exit 1
+              fi
               ctest --test-dir build --output-on-failure
 
               mkdir -p smoke
@@ -449,7 +492,7 @@ jobs:
               for f in build/libcidr-ping.so build/libcidr-ping.a; do
                 [ -f "$f" ] && cp "$f" pack/
               done
-              cp cidr-ping.h README.md pack/
+              cp cidr-ping.h text-util.h rtts-sort.h README.md pack/
               zip -j "/out/cidr-ping-${TAG}-${PLATFORM}.zip" pack/*
             ' _ "$TAG" "$PLATFORM"
 

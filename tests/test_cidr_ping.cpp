@@ -17,6 +17,7 @@
 
 #include "cidr-ping.h"
 #include "wireguard.h"
+#include "text-util.h"
 
 #include <atomic>
 #include <cstdio>
@@ -42,29 +43,19 @@ typedef int sock_len_t;
 #endif
 
 // ---------------------------------------------------------------------------
-// cidr-ping.cpp 中这些函数具有外部链接但未在头文件中声明，这里补上声明用于测试。
-// 签名必须与源文件完全一致，否则链接时报错。
+// cidr-ping.cpp 的这些函数/常量现在由 cidr-ping.h 公开导出，测试直接用它，
+// 不再自己镜像一份，避免签名漂移导致「测试测的是另一套语义」。
 // ---------------------------------------------------------------------------
-int  parse_ipv4_prefix(const char *prefix_str, unsigned int *ipv4_addr, int *prefix_len);
-int  parse_ipv6_prefix(const char *prefix_str, unsigned char *prefix, int *prefix_len);
-void generate_random_ipv4(unsigned int ipv4_addr, int prefix_len, char *output, size_t output_size);
-void generate_random_ipv6(const unsigned char *prefix, int prefix_len, char *output, size_t output_size);
-int  test_telnet_delay(const char *hostname, int port, double *delay_ms);
-int  test_udp_delay(const char *hostname, int port, const unsigned char *payload,
-                    size_t payload_len, double *delay_ms,
-                    unsigned char *resp_type, double budget_ms);
-int  test_target_delay(const char *hostname, int port, int protocol,
-                       const unsigned char *udp_payload, size_t udp_payload_len,
-                       double *delay_ms, unsigned char *resp_type, double budget_ms);
 
-// 与 cidr-ping.cpp 内部的返回码 / 协议枚举保持一致
-// （这些符号没有导出到头文件，测试侧只能自己镜像一份）
-static const int RP_OK          = 0;
-static const int RP_UDP_TIMEOUT = -5;
-static const int RP_UDP_ICMP    = -6;
+// 与 cidr-ping.cpp 的返回码 / 协议枚举保持一致（头文件已导出 CP_* 宏）
+static const int RP_OK          = CP_OK;
+static const int RP_UDP_TIMEOUT = CP_ERR_UDP_TIMEOUT;
+static const int RP_UDP_ICMP    = CP_ERR_UDP_ICMP;
 static const int RP_PROTO_TCP   = 0;
 static const int RP_PROTO_UDP   = 1;
 static const int RP_PROTO_WG    = 2;
+static const int RP_ERR_TIMEOUT = CP_ERR_TIMEOUT;
+static const int RP_ERR_NO_ADDR = CP_ERR_NO_ADDR;
 
 // UDP / WireGuard 的超时预算（毫秒），与 cidr-ping.cpp 的默认值一致
 static const double RP_BUDGET_MS = 1000.0;
@@ -263,15 +254,17 @@ struct UdpEchoServer {
     std::atomic<int> last_first;  // 最近一次收到的报文首字节
     std::atomic<unsigned long long> last_head64; // 最近一次收到报文的前 8 字节（小端打包）
     std::atomic<int> reply_first; // 回包首字节，默认 'p'（整体即 "pong"）
+    std::atomic<int> reply_len;   // 回包长度，默认 4；WG 用例可设为 92/64 构造合法报文
     std::thread th;
 
     UdpEchoServer() : fd(SOCK_INVALID), port(0), stop(false), recv_count(0),
-                      last_len(-1), last_first(-1), last_head64(0), reply_first('p') {}
+                      last_len(-1), last_first(-1), last_head64(0),
+                      reply_first('p'), reply_len(4) {}
 
     static void run(sock_t fd, std::atomic<bool> *stop_flag, std::atomic<int> *counter,
                     std::atomic<int> *last_len, std::atomic<int> *last_first,
                     std::atomic<unsigned long long> *last_head64,
-                    std::atomic<int> *reply_first) {
+                    std::atomic<int> *reply_first, std::atomic<int> *reply_len) {
         while (!stop_flag->load()) {
             fd_set rfds;
             FD_ZERO(&rfds);
@@ -297,11 +290,16 @@ struct UdpEchoServer {
             }
             last_head64->store(head);
 
-            // 回包内容固定（首字节可配），客户端只关心“有没有回包”和往返耗时
-            char out[4];
+            // 回包内容固定（首字节可配、长度可配），客户端只关心“有没有回包”和往返耗时。
+            // reply_len=92 且首字节 0x02 时，就是一个结构合法的 WireGuard 握手响应。
+            char out[256];
+            memset(out, 0, sizeof(out));
+            int rlen = reply_len->load();
+            if (rlen < 1) rlen = 1;
+            if (rlen > (int)sizeof(out)) rlen = (int)sizeof(out);
             out[0] = (char)(reply_first->load() & 0xff);
-            memcpy(out + 1, "ong", 3);
-            sendto(fd, out, sizeof(out), 0, (struct sockaddr *)&from, flen);
+            if (rlen == 4) memcpy(out + 1, "ong", 3); // 旧用例的 "pong"
+            sendto(fd, out, rlen, 0, (struct sockaddr *)&from, flen);
         }
     }
 
@@ -338,7 +336,7 @@ struct UdpEchoServer {
         last_head64.store(0);
         stop.store(false);
         th = std::thread(run, fd, &stop, &recv_count, &last_len, &last_first,
-                         &last_head64, &reply_first);
+                         &last_head64, &reply_first, &reply_len);
         return true;
     }
 
@@ -615,6 +613,7 @@ static void test_fd_leak_regression() {
     int fds_before = count_open_fds();
 #else
     int fds_before = -1;
+    (void)fds_before; // Windows 上没有 /proc/self/fd，只用它占位
 #endif
 
     const int kRounds = 1200; // 故意超过 FD_SETSIZE(1024)
@@ -1075,7 +1074,9 @@ static void test_wg_protocol_flags() {
     CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "--udp-timeout=99999",
                                                "127.0.0.1", "1", "1"}), 1);
 
-    // ⑤ 回声服务把回包首字节设成 0x02，模拟真实握手响应
+    // ⑤ 回声服务回一个「结构合法」的 WireGuard 握手响应：
+    //    92 字节、首字节 0x02、reserved 全 0。仅首字节是 0x02 的 4 字节报文
+    //    不再被当成 WG 端点（见下面的负向用例）。
     UdpEchoServer echo;
     if (!echo.start()) {
         ++g_fail;
@@ -1083,6 +1084,7 @@ static void test_wg_protocol_flags() {
         return;
     }
     echo.reply_first.store(WG_MSG_HANDSHAKE_RESPONSE);
+    echo.reply_len.store(92);
 
     // 分发函数：PROTO_WG 走 UDP 传输，并且要把回包首字节带回来
     {
@@ -1098,6 +1100,58 @@ static void test_wg_protocol_flags() {
         CHECK_EQ((int)rt, WG_MSG_HANDSHAKE_RESPONSE); // resp_type 真的被填了
         CHECK_EQ(echo.last_len.load(), (int)WG_HANDSHAKE_LEN);
         CHECK_EQ(echo.last_first.load(), WG_MSG_HANDSHAKE_INITIATION);
+    }
+
+    // ⑤b 「首字节 0x02、但长度不是 92」的报文必须被拒绝：它不可能是握手响应
+    {
+        UdpEchoServer fake;
+        if (!fake.start()) {
+            ++g_fail;
+            printf("   [FAIL] 无法开启假 WG 回声服务\n");
+        } else {
+            fake.reply_first.store(WG_MSG_HANDSHAKE_RESPONSE);
+            fake.reply_len.store(4); // 旧版会把它当成功，现在必须拒绝
+
+            unsigned char pkt[WG_HANDSHAKE_LEN];
+            memset(pkt, 0, sizeof(pkt));
+            pkt[0] = WG_MSG_HANDSHAKE_INITIATION;
+
+            double ms = -1.0;
+            unsigned char rt = 0;
+            int rc = test_target_delay("127.0.0.1", fake.port, RP_PROTO_WG, pkt,
+                                       sizeof(pkt), &ms, &rt, 300.0);
+            printf("   4 字节假 0x02 回包: 返回码 %d（必须非 0）\n", rc);
+            CHECK(rc != RP_OK);
+
+            // 同样的报文在普通 UDP 模式下仍然算「收到回包」
+            double d = -1.0;
+            CHECK_EQ(test_target_delay("127.0.0.1", fake.port, RP_PROTO_UDP, pkt,
+                                       sizeof(pkt), &d, NULL, 300.0), RP_OK);
+            fake.finish();
+        }
+    }
+
+    // ⑤c cookie reply（64 字节、首字节 0x03）是合法 WG 报文，应判成功
+    {
+        UdpEchoServer cookie;
+        if (!cookie.start()) {
+            ++g_fail;
+            printf("   [FAIL] 无法开启 cookie 回声服务\n");
+        } else {
+            cookie.reply_first.store(WG_MSG_COOKIE_REPLY);
+            cookie.reply_len.store(64);
+
+            unsigned char pkt[WG_HANDSHAKE_LEN];
+            memset(pkt, 0, sizeof(pkt));
+            pkt[0] = WG_MSG_HANDSHAKE_INITIATION;
+
+            double ms = -1.0;
+            unsigned char rt = 0;
+            CHECK_EQ(test_target_delay("127.0.0.1", cookie.port, RP_PROTO_WG, pkt,
+                                       sizeof(pkt), &ms, &rt, RP_BUDGET_MS), RP_OK);
+            CHECK_EQ((int)rt, WG_MSG_COOKIE_REPLY);
+            cookie.finish();
+        }
     }
 
     // ⑥ 走一遍完整入口：必须在网线上发出 148 字节握手包
@@ -1202,6 +1256,157 @@ static void test_wg_protocol_flags() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. 严格输入校验：尾随垃圾 / 多余段 / 溢出必须被拒绝
+// ---------------------------------------------------------------------------
+static void test_strict_input_validation() {
+    SECTION("严格输入校验（尾随垃圾 / 段数 / 溢出）");
+
+    unsigned int addr = 0;
+    int plen = -1;
+    unsigned char p6[16];
+    int plen6 = -1;
+
+    // 合法值仍然必须通过
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/24", &addr, &plen), 0);
+    CHECK_EQ(parse_ipv4_prefix("0.0.0.0/0", &addr, &plen), 0);
+    CHECK_EQ(parse_ipv4_prefix("255.255.255.255/32", &addr, &plen), 0);
+
+    // 前缀长度：尾随垃圾、空白、符号、空串一律拒绝
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/24x", &addr, &plen), -2);
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/2 4", &addr, &plen), -2);
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/+24", &addr, &plen), -2);
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/", &addr, &plen), -2);
+    CHECK_EQ(parse_ipv4_prefix("192.168.1.0/99999999999999999999", &addr, &plen), -2);
+
+    // 地址：多余段 / 空段 / 缺段 / 多个斜杠
+    CHECK_EQ(parse_ipv4_prefix("1.2.3.4.5/24", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix("1..3.4/24", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix("1.2.3./24", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix(".1.2.3/24", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix("1.2.3/24", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix("1.2.3.4/24/8", &addr, &plen), -3);
+    CHECK_EQ(parse_ipv4_prefix("1.2.3.4x/24", &addr, &plen), -3);
+
+    // IPv6 前缀长度同样严格
+    CHECK_EQ(parse_ipv6_prefix("2400:cb00::/48", p6, &plen6), 0);
+    CHECK_EQ(parse_ipv6_prefix("2400:cb00::/48x", p6, &plen6), -2);
+    CHECK_EQ(parse_ipv6_prefix("2400:cb00::/", p6, &plen6), -2);
+    CHECK_EQ(parse_ipv6_prefix("2400:cb00::/4 8", p6, &plen6), -2);
+    CHECK_EQ(parse_ipv6_prefix("2400:cb00::/48/8", p6, &plen6), -3);
+    CHECK_EQ(parse_ipv6_prefix("/48", p6, &plen6), -3);
+
+    // 命令行数值：atoi 会接受的 "443x"/"5x" 现在必须报错退出
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", "443x", "1"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", "1", "5x"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", "1",
+                                               "99999999999999999999"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", " 1", "1"}), 1);
+
+    // 超时参数：只接受有限正数
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "--tcp-timeout=abc",
+                                               "127.0.0.1", "1", "1"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "--tcp-timeout=0",
+                                               "127.0.0.1", "1", "1"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "--udp-timeout=nan",
+                                               "127.0.0.1", "1", "1"}), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 13. 目标格式化与状态文本
+// ---------------------------------------------------------------------------
+static void test_target_formatting() {
+    SECTION("cp_format_target / cp_status_text");
+
+    char host[128];
+    char hp[160];
+
+    cp_format_target("2400:cb00::1", 443, host, sizeof(host), hp, sizeof(hp));
+    CHECK_STREQ(host, "[2400:cb00::1]");
+    CHECK_STREQ(hp, "[2400:cb00::1]:443");
+
+    cp_format_target("192.168.1.1", 22, host, sizeof(host), hp, sizeof(hp));
+    CHECK_STREQ(host, "192.168.1.1");
+    CHECK_STREQ(hp, "192.168.1.1:22");
+
+    // 含冒号但不是 IPv6 字面量（例如主机名）不应被加方括号
+    cp_format_target("example.com", 80, host, sizeof(host), hp, sizeof(hp));
+    CHECK_STREQ(host, "example.com");
+    CHECK_STREQ(hp, "example.com:80");
+
+    char st[64];
+    char det[192];
+    cp_status_text(RP_PROTO_TCP, RP_ERR_TIMEOUT, 0, st, sizeof(st), det, sizeof(det));
+    CHECK_STREQ(st, "连接失败");
+
+    cp_status_text(RP_PROTO_WG, CP_ERR_WG_NOT_WG, 0, st, sizeof(st), det, sizeof(det));
+    CHECK_STREQ(st, "WG无有效回包");
+
+    cp_status_text(RP_PROTO_WG, RP_OK, WG_MSG_HANDSHAKE_RESPONSE, st, sizeof(st), det, sizeof(det));
+    CHECK_STREQ(st, "WG握手响应(0x02)");
+
+    cp_status_text(RP_PROTO_WG, RP_OK, 0x7f, st, sizeof(st), det, sizeof(det));
+    CHECK_STREQ(st, "WG未知报文(0x7f)");
+
+    cp_status_text(RP_PROTO_UDP, CP_ERR_UDP_ICMP, 0, st, sizeof(st), det, sizeof(det));
+    CHECK_STREQ(st, "UDP端口不可达");
+}
+
+// ---------------------------------------------------------------------------
+// 14. CSV 转义端到端：含逗号的主机名必须仍是一列
+// ---------------------------------------------------------------------------
+static void test_csv_escaping_end_to_end() {
+    SECTION("CSV 转义（含逗号的目标）");
+
+    // "a,b" 不是 CIDR，按单主机处理；解析必然失败，但结果行必须被正确转义
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "a,b", "1", "1"}), 0);
+
+    std::string line = first_csv_line("rtts.csv");
+    printf("   CSV 首行: %s\n", line.c_str());
+
+    std::vector<std::string> fields;
+    CHECK(csv_split_line(line, fields));
+    CHECK_EQ((int)fields.size(), 5);       // ip,host,hostport,延迟,detail
+    CHECK_STREQ(fields[0], "a,b");         // 没有被逗号劈成两列
+    CHECK_STREQ(fields[1], "a,b");
+    CHECK(fields[3] == "无法解析主机名");
+    CHECK(!fields[4].empty());             // 诊断列应有 getaddrinfo 细节
+
+    // 引号也要能被正确还原
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "q\"uote", "1", "1"}), 0);
+    line = first_csv_line("rtts.csv");
+    CHECK(csv_split_line(line, fields));
+    CHECK_STREQ(fields[0], "q\"uote");
+}
+
+// ---------------------------------------------------------------------------
+// 15. 采样去重：小网段不允许生成超过地址数的目标
+// ---------------------------------------------------------------------------
+static void test_sampling_dedup() {
+    SECTION("随机采样去重 / 小网段边界");
+
+    // /30 只有 4 个地址，请求 10 个必须被明确拒绝（而不是静默重复测试）
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", "1", "10"}), 1);
+
+    // 不显式给数量时，默认值 10 只作为上限：/32 应收敛成 1 个目标而不是报错
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.1/32", "1"}), 0);
+    CHECK_EQ(count_csv_rows("rtts.csv"), 1);
+
+    // 显式要求超量仍然必须报错
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.1/32", "1", "10"}), 1);
+
+    // 请求 4 个恰好覆盖整段
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "127.0.0.0/30", "1", "4"}), 0);
+    CHECK_EQ(count_csv_rows("rtts.csv"), 4);
+
+    // IPv6 /126 同样只有 4 个地址
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "2400:cb00:2049::/126",
+                                               "1", "9"}), 1);
+    CHECK_EQ(run_main(std::vector<std::string>{"cidr-ping", "2400:cb00:2049::/126",
+                                               "1", "4"}), 0);
+    CHECK_EQ(count_csv_rows("rtts.csv"), 4);
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -1221,6 +1426,10 @@ int main(int argc, char *argv[]) {
     test_wireguard_primitives();
     test_wireguard_handshake();
     test_wg_protocol_flags();
+    test_strict_input_validation();
+    test_target_formatting();
+    test_csv_escaping_end_to_end();
+    test_sampling_dedup();
 
     printf("\n----------------------------------------\n");
     printf("通过: %d, 失败: %d\n", g_pass, g_fail);
